@@ -5,6 +5,9 @@
     "prev": ["left", "h"],
     "seek_forward": ["up", "k"],
     "seek_backward": ["down", "j"],
+    "toggle_filename": ["f"],
+    "toggle_playback": [" "],
+    "ab_loop": ["L"],
     "quit": ["q", "Q"]
   }
 }

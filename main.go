@@ -11,6 +11,7 @@ import (
 	"math/rand"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -39,6 +40,13 @@ type Switcher struct {
 
 	tmpA [][2]float64
 	tmpB [][2]float64
+
+	// A/B loop state (frame indices in the current buffer).
+	// Press 'l' once: set A; twice: set B and enable looping [A,B); third time: clear.
+	loopStage   int  // 0 none, 1 A set, 2 A+B set
+	loopEnabled bool // true when looping is active
+	loopA       int
+	loopB       int
 }
 
 func (s *Switcher) startTransition(toCur int, toPos int) {
@@ -61,6 +69,89 @@ func (s *Switcher) startTransition(toCur int, toPos int) {
 	s.pos = s.toPos
 }
 
+func (s *Switcher) clearLoopLocked() {
+	s.loopStage = 0
+	s.loopEnabled = false
+	s.loopA = 0
+	s.loopB = 0
+}
+
+func (s *Switcher) effectivePosLocked() int {
+	if s.xfadeLeft > 0 {
+		return s.toPos
+	}
+	return s.pos
+}
+
+func (s *Switcher) clampLoopToCurrentLocked() {
+	if !(s.loopEnabled && s.loopStage == 2) {
+		return
+	}
+	bufLen := s.buffers[s.cur].Len()
+	if s.loopA < 0 {
+		s.loopA = 0
+	}
+	if s.loopB > bufLen {
+		s.loopB = bufLen
+	}
+	if s.loopB <= s.loopA {
+		s.clearLoopLocked()
+		return
+	}
+	if s.pos < s.loopA {
+		s.pos = s.loopA
+	}
+	if s.pos >= s.loopB {
+		s.pos = s.loopA
+	}
+}
+
+func (s *Switcher) markLoopLocked() (event string, a int, b int) {
+	p := s.effectivePosLocked()
+
+	switch s.loopStage {
+	case 0:
+		s.loopA = p
+		s.loopStage = 1
+		return "A", s.loopA, 0
+
+	case 1:
+		s.loopB = p
+		if s.loopB < s.loopA {
+			s.loopA, s.loopB = s.loopB, s.loopA
+		}
+		// Require a non-empty interval.
+		if s.loopB <= s.loopA {
+			return "", s.loopA, s.loopB
+		}
+
+		// Clamp to current buffer length.
+		bufLen := s.buffers[s.cur].Len()
+		if s.loopA < 0 {
+			s.loopA = 0
+		}
+		if s.loopB > bufLen {
+			s.loopB = bufLen
+		}
+		if s.loopB <= s.loopA {
+			return "", s.loopA, s.loopB
+		}
+
+		s.loopEnabled = true
+		s.loopStage = 2
+		if s.pos >= s.loopB {
+			s.pos = s.loopA
+		}
+		return "B", s.loopA, s.loopB
+
+	case 2:
+		s.clearLoopLocked()
+		return "clear", 0, 0
+	}
+
+	return "", 0, 0
+}
+
 func (s *Switcher) Add(delta int) {
 	s.mu.Lock()
 	n := len(s.buffers)
@@ -71,6 +162,31 @@ func (s *Switcher) Add(delta int) {
 
 	// crossfade from current -> next at the same sample index (synced files)
 	s.startTransition(next, s.pos)
+
+	// Keep global loop, but clamp in case the new buffer is shorter.
+	s.clampLoopToCurrentLocked()
+
+	s.mu.Unlock()
+}
+
+func (s *Switcher) AddInstant(delta int) {
+	s.mu.Lock()
+	n := len(s.buffers)
+	next := (s.cur + delta) % n
+	if next < 0 {
+		next += n
+	}
+
+	s.xfadeLeft = 0
+	s.cur = next
+
+	bufLen := s.buffers[s.cur].Len()
+	if s.pos > bufLen {
+		s.pos = bufLen
+	}
+
+	// Keep global loop, but clamp in case the new buffer is shorter.
+	s.clampLoopToCurrentLocked()
 
 	s.mu.Unlock()
 }
@@ -87,8 +203,46 @@ func (s *Switcher) Seek(deltaFrames int) {
 		target = bufLen
 	}
 
+	// If looping is enabled, keep the seek target inside [A,B).
+	if s.loopEnabled && s.loopB > s.loopA {
+		if target < s.loopA {
+			target = s.loopA
+		}
+		if target >= s.loopB {
+			target = s.loopA
+		}
+	}
+
 	// crossfade within the same track: old position -> new position
 	s.startTransition(s.cur, target)
+
+	s.mu.Unlock()
+}
+
+func (s *Switcher) SeekInstant(deltaFrames int) {
+	s.mu.Lock()
+
+	target := s.pos + deltaFrames
+	if target < 0 {
+		target = 0
+	}
+	bufLen := s.buffers[s.cur].Len()
+	if target > bufLen {
+		target = bufLen
+	}
+
+	// If looping is enabled, keep the seek target inside [A,B).
+	if s.loopEnabled && s.loopB > s.loopA {
+		if target < s.loopA {
+			target = s.loopA
+		}
+		if target >= s.loopB {
+			target = s.loopA
+		}
+	}
+
+	s.xfadeLeft = 0
+	s.pos = target
 
 	s.mu.Unlock()
 }
@@ -129,8 +283,64 @@ func readFromBufferLoop(buf *beep.Buffer, pos *int, out [][2]float64) int {
 	return written
 }
 
+// Like readFromBufferLoop, but if loopEnabled it loops within [loopA, loopB) instead of the whole buffer.
+func readFromBufferLoopRegion(buf *beep.Buffer, pos *int, out [][2]float64, loopEnabled bool, loopA int, loopB int) int {
+	if !loopEnabled {
+		return readFromBufferLoop(buf, pos, out)
+	}
+
+	if len(out) == 0 {
+		return 0
+	}
+	bufLen := buf.Len()
+	if bufLen <= 0 {
+		for i := range out {
+			out[i][0], out[i][1] = 0, 0
+		}
+		return len(out)
+	}
+
+	// Normalize/clamp loop bounds.
+	if loopA < 0 {
+		loopA = 0
+	}
+	if loopB > bufLen {
+		loopB = bufLen
+	}
+	if loopB <= loopA {
+		return readFromBufferLoop(buf, pos, out)
+	}
+
+	written := 0
+	for written < len(out) {
+		if *pos < loopA || *pos >= loopB {
+			*pos = loopA
+		}
+		remain := len(out) - written
+		chunk := loopB - *pos
+		if chunk > remain {
+			chunk = remain
+		}
+		st := buf.Streamer(*pos, *pos+chunk)
+		n, _ := st.Stream(out[written : written+chunk])
+		written += n
+		*pos += n
+		if n < chunk {
+			for i := written; i < len(out); i++ {
+				out[i][0], out[i][1] = 0, 0
+			}
+			return len(out)
+		}
+	}
+	return written
+}
+
 func (s *Switcher) Stream(samples [][2]float64) (n int, ok bool) {
 	s.mu.Lock()
+
+	loopEnabled := s.loopEnabled
+	loopA := s.loopA
+	loopB := s.loopB
 
 	// Crossfade path (used for both track switches and seeks).
 	if s.xfadeLeft > 0 && s.xfadeTotal > 0 {
@@ -152,8 +362,10 @@ func (s *Switcher) Stream(samples [][2]float64) (n int, ok bool) {
 		fp := s.fromPos
 		tp := s.toPos
 
-		readFromBufferLoop(fromBuf, &fp, a)
-		readFromBufferLoop(toBuf, &tp, b)
+		// Only apply A/B looping during fades when both sides refer to the same track.
+		sameTrack := (s.fromCur == s.toCur)
+		readFromBufferLoopRegion(fromBuf, &fp, a, loopEnabled && sameTrack, loopA, loopB)
+		readFromBufferLoopRegion(toBuf, &tp, b, loopEnabled && sameTrack, loopA, loopB)
 
 		start := s.xfadeTotal - s.xfadeLeft // frames already faded
 		for i := 0; i < k; i++ {
@@ -175,7 +387,7 @@ func (s *Switcher) Stream(samples [][2]float64) (n int, ok bool) {
 		if k < len(samples) {
 			buf := s.buffers[s.cur]
 			p := s.pos
-			readFromBufferLoop(buf, &p, samples[k:])
+			readFromBufferLoopRegion(buf, &p, samples[k:], loopEnabled, loopA, loopB)
 			s.pos = p
 		}
 
@@ -186,7 +398,7 @@ func (s *Switcher) Stream(samples [][2]float64) (n int, ok bool) {
 	// Normal path: loop forever.
 	buf := s.buffers[s.cur]
 	p := s.pos
-	readFromBufferLoop(buf, &p, samples)
+	readFromBufferLoopRegion(buf, &p, samples, loopEnabled, loopA, loopB)
 	s.pos = p
 
 	s.mu.Unlock()
@@ -384,6 +596,8 @@ func defaultConfig() Config {
 			"seek_forward":    {"up"},
 			"seek_backward":   {"down"},
 			"toggle_filename": {"f"},
+			"toggle_playback": {" "},
+			"ab_loop":         {"l"},
 			"quit":            {"q", "Q"},
 		},
 	}
@@ -493,6 +707,59 @@ func resolveTargetSampleRate(target string, paths []string, verbose bool) (int, 
 		return 0, fmt.Errorf("invalid --target-sr %q (use: first | highest | <number>)", target)
 	}
 	return n, nil
+}
+
+func termWidth() int {
+	w, _, err := term.GetSize(int(os.Stdout.Fd()))
+	if err != nil || w <= 0 {
+		return 80
+	}
+	return w
+}
+
+func padOrTrim(s string, w int) string {
+	if w <= 0 {
+		return ""
+	}
+	rs := []rune(s)
+	if len(rs) > w {
+		return string(rs[:w])
+	}
+	if len(rs) < w {
+		return string(rs) + strings.Repeat(" ", w-len(rs))
+	}
+	return s
+}
+
+func renderLine(showFilename bool, paused bool, cur int, total int, path string, sr beep.SampleRate, loopStage int, loopA int, loopB int) {
+	state := "PLAY"
+	if paused {
+		state = "PAUSE"
+	}
+
+	base := filepath.Base(path)
+	if !showFilename {
+		base = ""
+	}
+
+	loopTxt := ""
+	switch loopStage {
+	case 1:
+		loopTxt = fmt.Sprintf("A=%.3fs", float64(loopA)/float64(sr))
+	case 2:
+		loopTxt = fmt.Sprintf("A=%.3fs B=%.3fs", float64(loopA)/float64(sr), float64(loopB)/float64(sr))
+	}
+
+	left := fmt.Sprintf("[%d/%d] %s", cur+1, total, state)
+	if loopTxt != "" {
+		left += " " + loopTxt
+	}
+	if base != "" {
+		left += "  " + base
+	}
+
+	w := termWidth()
+	fmt.Printf("\r%s", padOrTrim(left, w-1))
 }
 
 func main() {
@@ -634,6 +901,7 @@ func main() {
 			if err != nil {
 				if verbose {
 					fmt.Fprintf(os.Stderr, "config reload failed: %v\n", err)
+					continue
 				}
 				continue
 			}
@@ -675,10 +943,14 @@ func main() {
 		}
 	}
 
-	speaker.Play(switcher)
+	// beep.Ctrl implements play/pause by gating the stream.
+	ctrl := &beep.Ctrl{Streamer: switcher, Paused: false}
+	speaker.Play(ctrl)
 
 	oldState, _ := term.MakeRaw(int(os.Stdin.Fd()))
 	defer term.Restore(int(os.Stdin.Fd()), oldState)
+
+	renderLine(showFilenameAtomic.Load(), ctrl.Paused, switcher.cur, len(paths), paths[switcher.cur], format.SampleRate, switcher.loopStage, switcher.loopA, switcher.loopB)
 
 	keybuf := make([]byte, 16)
 	for {
@@ -700,7 +972,6 @@ func main() {
 		}
 
 		if action == "quit" {
-			fmt.Println("\nBye.")
 			return
 		}
 
@@ -709,24 +980,44 @@ func main() {
 		speaker.Lock()
 		switch action {
 		case "prev":
-			switcher.Add(-1)
+			if ctrl.Paused {
+				switcher.AddInstant(-1)
+			} else {
+				switcher.Add(-1)
+			}
 		case "next":
-			switcher.Add(+1)
+			if ctrl.Paused {
+				switcher.AddInstant(+1)
+			} else {
+				switcher.Add(+1)
+			}
 		case "seek_forward":
-			switcher.Seek(+jumpFrames)
+			if ctrl.Paused {
+				switcher.SeekInstant(+jumpFrames)
+			} else {
+				switcher.Seek(+jumpFrames)
+			}
 		case "seek_backward":
-			switcher.Seek(-jumpFrames)
+			if ctrl.Paused {
+				switcher.SeekInstant(-jumpFrames)
+			} else {
+				switcher.Seek(-jumpFrames)
+			}
 		case "toggle_filename":
 			showFilenameAtomic.Store(!showFilenameAtomic.Load())
+		case "toggle_playback":
+			ctrl.Paused = !ctrl.Paused
+		case "ab_loop":
+			switcher.mu.Lock()
+			ev, _, _ := switcher.markLoopLocked()
+			switcher.mu.Unlock()
+
+			if ev == "A" || ev == "B" || ev == "clear" {
+				// status is rendered below
+			}
 		}
 
-		// Refresh filename line if enabled
-		if showFilenameAtomic.Load() && (action == "prev" || action == "next" || action == "toggle_filename") {
-			fmt.Printf("\rNow: [%d] %s            ", switcher.cur, paths[switcher.cur])
-		}
-		if !showFilenameAtomic.Load() && action == "toggle_filename" {
-			fmt.Print("\r                              ")
-		}
+		renderLine(showFilenameAtomic.Load(), ctrl.Paused, switcher.cur, len(paths), paths[switcher.cur], format.SampleRate, switcher.loopStage, switcher.loopA, switcher.loopB)
 		speaker.Unlock()
 	}
 }
