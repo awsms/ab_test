@@ -414,6 +414,37 @@ type ffprobeOut struct {
 	} `json:"streams"`
 }
 
+// isAudioFileFFprobe returns true if ffprobe can find at least one audio stream.
+// Used to ignore non-audio inputs (e.g. .txt) without erroring.
+func isAudioFileFFprobe(path string, verbose bool) (bool, error) {
+	cmd := exec.Command(
+		"ffprobe",
+		"-v", "error",
+		"-select_streams", "a",
+		"-show_entries", "stream=codec_type",
+		"-of", "json",
+		path,
+	)
+	out, err := cmd.Output()
+	if err != nil {
+		// Treat unreadable / invalid files as non-audio and skip them.
+		if verbose {
+			return false, fmt.Errorf("ffprobe (audio check) failed for %s: %w", path, err)
+		}
+		return false, nil
+	}
+
+	var p struct {
+		Streams []struct {
+			CodecType string `json:"codec_type"`
+		} `json:"streams"`
+	}
+	if e := json.Unmarshal(out, &p); e != nil {
+		return false, e
+	}
+	return len(p.Streams) > 0, nil
+}
+
 func runFFprobe(path string, verbose bool) (sr int, ch int, rawJSON string, err error) {
 	// ffprobe -v error -select_streams a:0 -show_entries stream=sample_rate,channels -of json <file>
 	cmd := exec.Command(
@@ -823,6 +854,26 @@ func main() {
 		filtered = append(filtered, p)
 	}
 	paths = filtered
+
+	// Filter out non-audio files (skip anything without an audio stream).
+	audioOnly := make([]string, 0, len(paths))
+	for _, p := range paths {
+		ok, err := isAudioFileFFprobe(p, verbose)
+		if err != nil {
+			if verbose {
+				fmt.Fprintf(os.Stderr, "skip non-audio (probe error): %s: %v\n", p, err)
+			}
+			continue
+		}
+		if !ok {
+			if verbose {
+				fmt.Fprintf(os.Stderr, "skip non-audio: %s\n", p)
+			}
+			continue
+		}
+		audioOnly = append(audioOnly, p)
+	}
+	paths = audioOnly
 
 	if len(paths) < 2 {
 		fmt.Fprintf(os.Stderr, "Usage: %s [-i startIndex] [--show-filename] [--verbose] [--config path.json] [--no-shuffle] [--target-sr first|highest|N] [--display-filename-on-change] file1 file2 [file3...]\n", os.Args[0])
