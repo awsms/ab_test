@@ -44,11 +44,19 @@ func (s *Switcher) Stream(samples [][2]float64) (n int, ok bool) {
 	s.mu.RUnlock()
 
 	bufLen := buf.Len()
-	if bufLen <= 0 || pos >= bufLen {
+	if bufLen <= 0 {
 		for i := range samples {
 			samples[i][0], samples[i][1] = 0, 0
 		}
-		return 0, false
+		return len(samples), true
+	}
+
+	// loop instead of stopping
+	if pos >= bufLen {
+		s.mu.Lock()
+		s.pos = 0
+		pos = 0
+		s.mu.Unlock()
 	}
 
 	end := pos + len(samples)
@@ -57,9 +65,9 @@ func (s *Switcher) Stream(samples [][2]float64) (n int, ok bool) {
 	}
 
 	streamer := buf.Streamer(pos, end)
-	n, ok = streamer.Stream(samples[:end-pos])
+	n, _ = streamer.Stream(samples[:end-pos])
 
-	// pad remainder if EOF
+	// pad remainder if we wrapped
 	for i := n; i < len(samples); i++ {
 		samples[i][0], samples[i][1] = 0, 0
 	}
@@ -68,7 +76,7 @@ func (s *Switcher) Stream(samples [][2]float64) (n int, ok bool) {
 	s.pos += n
 	s.mu.Unlock()
 
-	return n, ok
+	return len(samples), true
 }
 
 func (s *Switcher) Err() error { return nil }
@@ -162,11 +170,7 @@ func decodeToBufferFFmpegRawFloat32(path string, want *beep.Format, verbose bool
 		return nil, beep.Format{}, err
 	}
 
-	if ch == 1 {
-		// ok (we'll duplicate to stereo)
-	} else if ch == 2 {
-		// ok
-	} else {
+	if ch != 1 && ch != 2 {
 		return nil, beep.Format{}, fmt.Errorf("unsupported channel count %d for %s (only 1 or 2 supported)", ch, path)
 	}
 
@@ -176,7 +180,6 @@ func decodeToBufferFFmpegRawFloat32(path string, want *beep.Format, verbose bool
 		"-i", path,
 		"-vn",
 		"-map", "0:a:0",
-		// No -ar, no -ac => no resampling / no channel remix.
 		"-f", "f32le",
 		"-c:a", "pcm_f32le",
 		"pipe:1",
@@ -193,67 +196,45 @@ func decodeToBufferFFmpegRawFloat32(path string, want *beep.Format, verbose bool
 	if err != nil {
 		return nil, beep.Format{}, fmt.Errorf("ffmpeg failed for %s: %v; ffmpeg: %s", path, err, stderr.String())
 	}
-	if len(raw) == 0 {
-		return nil, beep.Format{}, fmt.Errorf("ffmpeg produced 0 bytes for %s; ffmpeg: %s", path, stderr.String())
-	}
-	if len(raw)%4 != 0 {
-		return nil, beep.Format{}, fmt.Errorf("ffmpeg produced %d bytes (not multiple of 4) for %s", len(raw), path)
+	if len(raw) == 0 || len(raw)%4 != 0 {
+		return nil, beep.Format{}, fmt.Errorf("invalid ffmpeg output for %s", path)
 	}
 
-	// Convert float32 little-endian samples to beep stereo frames.
-	// If mono, duplicate to L/R. If stereo, map as-is.
 	totalF32 := len(raw) / 4
-	if totalF32%ch != 0 {
-		return nil, beep.Format{}, fmt.Errorf("raw sample count %d not divisible by channels %d for %s", totalF32, ch, path)
-	}
 	frames := totalF32 / ch
-	if verbose {
-		fmt.Fprintf(os.Stderr, "decoded: sr=%d ch=%d float32-samples=%d frames=%d\n", sr, ch, totalF32, frames)
-	}
 
-	// Build a streamer over the frames without huge intermediate conversions.
-	// We'll still ultimately store in beep.Buffer (RAM), consistent with your “instant switch” requirement.
 	format := beep.Format{
 		SampleRate:  beep.SampleRate(sr),
-		NumChannels: 2, // speaker wants stereo frames [2]float64; beep uses stereo sample arrays
-		Precision:   2, // not super meaningful here; keep 2 like typical 16-bit
+		NumChannels: 2,
+		Precision:   2,
 	}
 
-	// If enforcing same sr/ch across files:
 	if want != nil {
 		if format.SampleRate != want.SampleRate || format.NumChannels != want.NumChannels {
-			return nil, beep.Format{}, fmt.Errorf(
-				"format mismatch for %s: got %d Hz, %d ch; want %d Hz, %d ch",
-				path, format.SampleRate, format.NumChannels, want.SampleRate, want.NumChannels,
-			)
+			return nil, beep.Format{}, fmt.Errorf("format mismatch for %s", path)
 		}
 	}
 
-	// Streamer that reads from raw bytes and emits stereo float64 frames.
-	var idx int // float32 index (not byte index)
+	var idx int
 	streamer := beep.StreamerFunc(func(out [][2]float64) (n int, ok bool) {
-		// remaining frames in raw
-		remainingFrames := frames - (idx / ch)
-		if remainingFrames <= 0 {
+		remaining := frames - (idx / ch)
+		if remaining <= 0 {
 			return 0, false
 		}
 		max := len(out)
-		if remainingFrames < max {
-			max = remainingFrames
+		if remaining < max {
+			max = remaining
 		}
-
 		for i := 0; i < max; i++ {
 			if ch == 1 {
 				v := f32From(raw, idx)
-				idx += 1
-				out[i][0] = clampFloat64(float64(v))
-				out[i][1] = clampFloat64(float64(v))
+				idx++
+				out[i][0], out[i][1] = float64(v), float64(v)
 			} else {
 				l := f32From(raw, idx)
 				r := f32From(raw, idx+1)
 				idx += 2
-				out[i][0] = clampFloat64(float64(l))
-				out[i][1] = clampFloat64(float64(r))
+				out[i][0], out[i][1] = float64(l), float64(r)
 			}
 		}
 		return max, true
@@ -261,33 +242,12 @@ func decodeToBufferFFmpegRawFloat32(path string, want *beep.Format, verbose bool
 
 	buf := beep.NewBuffer(format)
 	buf.Append(streamer)
-	if buf.Len() == 0 {
-		return nil, beep.Format{}, fmt.Errorf("decoded 0 frames from %s (unexpected)", path)
-	}
-
-	if verbose {
-		fmt.Fprintf(os.Stderr, "buffer frames stored: %d\n", buf.Len())
-	}
 	return buf, format, nil
 }
 
-func f32From(b []byte, f32Index int) float32 {
-	off := f32Index * 4
-	u := binary.LittleEndian.Uint32(b[off : off+4])
-	return math.Float32frombits(u)
-}
-
-func clampFloat64(x float64) float64 {
-	if x > 1.0 {
-		return 1.0
-	}
-	if x < -1.0 {
-		return -1.0
-	}
-	if math.IsNaN(x) || math.IsInf(x, 0) {
-		return 0.0
-	}
-	return x
+func f32From(b []byte, i int) float32 {
+	off := i * 4
+	return math.Float32frombits(binary.LittleEndian.Uint32(b[off:]))
 }
 
 func main() {
@@ -307,39 +267,35 @@ func main() {
 
 	firstBuf, format, err := decodeToBufferFFmpegRawFloat32(paths[0], nil, verbose)
 	if err != nil {
-		log.Fatalf("decode %s: %v", paths[0], err)
+		log.Fatal(err)
 	}
 
 	jumpFrames := int(format.SampleRate) * 5
 
-	bufferSize := format.SampleRate.N(50e6) // ~50ms
+	bufferSize := format.SampleRate.N(50e6)
 	if bufferSize < 1024 {
 		bufferSize = 1024
 	}
-	if err := speaker.Init(format.SampleRate, bufferSize); err != nil {
-		log.Fatalf("speaker init: %v", err)
-	}
+	speaker.Init(format.SampleRate, bufferSize)
 
 	switcher := &Switcher{
 		buffers: []*beep.Buffer{firstBuf},
 		cur:     0,
 		pos:     0,
 	}
-
 	for _, p := range paths[1:] {
 		buf, _, err := decodeToBufferFFmpegRawFloat32(p, &format, verbose)
 		if err != nil {
-			log.Fatalf("decode %s: %v", p, err)
+			log.Fatal(err)
 		}
 		switcher.buffers = append(switcher.buffers, buf)
 	}
 
-	if startIndex < 0 || startIndex >= len(switcher.buffers) {
-		startIndex = 0
+	if startIndex >= 0 && startIndex < len(switcher.buffers) {
+		switcher.cur = startIndex
 	}
-	switcher.cur = startIndex
 
-	fmt.Println("Controls: ←/→ switch, q quit")
+	fmt.Println("Controls: ←/→ switch, ↑/↓ ±5s, q quit")
 	fmt.Printf("Loaded %d files. Format: %d Hz, %d ch\n", len(paths), format.SampleRate, format.NumChannels)
 	if showFilename {
 		fmt.Printf("Start: [%d] %s\n", switcher.cur, paths[switcher.cur])
@@ -347,52 +303,29 @@ func main() {
 
 	speaker.Play(switcher)
 
-	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
-	if err != nil {
-		log.Fatalf("term raw mode: %v", err)
-	}
+	oldState, _ := term.MakeRaw(int(os.Stdin.Fd()))
 	defer term.Restore(int(os.Stdin.Fd()), oldState)
 
 	keybuf := make([]byte, 16)
 	for {
-		n, err := os.Stdin.Read(keybuf)
-		if err != nil {
-			log.Fatalf("stdin read: %v", err)
-		}
-		if n == 0 {
-			continue
-		}
+		n, _ := os.Stdin.Read(keybuf)
 		if n == 1 && (keybuf[0] == 'q' || keybuf[0] == 'Q') {
 			fmt.Println("\nBye.")
 			return
 		}
 		if n >= 3 && keybuf[0] == 0x1b && keybuf[1] == '[' {
+			speaker.Lock()
 			switch keybuf[2] {
-			case 'D': // left
-				speaker.Lock()
+			case 'D':
 				switcher.Add(-1)
-				cur := switcher.cur
-				speaker.Unlock()
-				if showFilename {
-					fmt.Printf("\rNow: [%d] %s            ", cur, paths[cur])
-				}
-			case 'C': // right
-				speaker.Lock()
+			case 'C':
 				switcher.Add(+1)
-				cur := switcher.cur
-				speaker.Unlock()
-				if showFilename {
-					fmt.Printf("\rNow: [%d] %s            ", cur, paths[cur])
-				}
-			case 'A': // up
-				speaker.Lock()
+			case 'A':
 				switcher.Seek(+jumpFrames)
-				speaker.Unlock()
-			case 'B': // down
-				speaker.Lock()
+			case 'B':
 				switcher.Seek(-jumpFrames)
-				speaker.Unlock()
 			}
+			speaker.Unlock()
 		}
 	}
 }
