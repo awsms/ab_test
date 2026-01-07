@@ -1,19 +1,19 @@
 package main
 
 import (
+	"bytes"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
+	"os/exec"
 	"sync"
 
 	"golang.org/x/term"
 
 	"github.com/faiface/beep"
-	"github.com/faiface/beep/flac"
-	"github.com/faiface/beep/mp3"
 	"github.com/faiface/beep/speaker"
-	"github.com/faiface/beep/vorbis"
 	"github.com/faiface/beep/wav"
 )
 
@@ -22,13 +22,6 @@ type Switcher struct {
 	buffers []*beep.Buffer
 	cur     int // current buffer index
 	pos     int // current sample index (frames)
-	format  beep.Format
-}
-
-func (s *Switcher) SetIndex(i int) {
-	s.mu.Lock()
-	s.cur = i
-	s.mu.Unlock()
 }
 
 func (s *Switcher) Add(delta int) {
@@ -42,8 +35,8 @@ func (s *Switcher) Add(delta int) {
 }
 
 // Stream implements beep.Streamer.
-// It always streams from the currently selected buffer starting at s.pos.
-// Switching files keeps s.pos constant, so playback stays sample-aligned.
+// It streams from the currently selected buffer starting at s.pos.
+// Switching files keeps s.pos constant => sample-aligned switching.
 func (s *Switcher) Stream(samples [][2]float64) (n int, ok bool) {
 	s.mu.RLock()
 	buf := s.buffers[s.cur]
@@ -62,123 +55,89 @@ func (s *Switcher) Stream(samples [][2]float64) (n int, ok bool) {
 
 func (s *Switcher) Err() error { return nil }
 
-func decodeToBuffer(path string, want beep.Format) (*beep.Buffer, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	var (
-		stream beep.StreamSeekCloser
-		format beep.Format
+func ffmpegWavDecode(path string) (beep.StreamSeekCloser, beep.Format, func() error, error) {
+	// Decode *any* audio to WAV on stdout, preserving SR/channels by default.
+	cmd := exec.Command(
+		"ffmpeg",
+		"-hide_banner",
+		"-loglevel", "error",
+		"-i", path,
+		"-vn",
+		"-f", "wav",
+		"pipe:1",
 	)
-	ext := fileExtLower(path)
 
-	switch ext {
-	case ".wav":
-		stream, format, err = wav.Decode(f)
-	case ".mp3":
-		stream, format, err = mp3.Decode(f)
-	case ".flac":
-		stream, format, err = flac.Decode(f)
-	case ".ogg":
-		stream, format, err = vorbis.Decode(f)
-	default:
-		return nil, fmt.Errorf("unsupported extension %q (supported: .wav .mp3 .flac .ogg)", ext)
-	}
+	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return nil, err
+		return nil, beep.Format{}, nil, err
 	}
-	defer stream.Close()
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
 
-	// Since you assume sample-synced, we enforce identical format.
-	if format.SampleRate != want.SampleRate || format.NumChannels != want.NumChannels {
-		return nil, fmt.Errorf(
-			"format mismatch for %s: got %d Hz, %d ch; want %d Hz, %d ch",
-			path, format.SampleRate, format.NumChannels, want.SampleRate, want.NumChannels,
-		)
+	if err := cmd.Start(); err != nil {
+		return nil, beep.Format{}, nil, err
 	}
 
-	buf := beep.NewBuffer(want)
-	buf.Append(stream) // decodes the whole file into memory
-	return buf, nil
+	// wav.Decode expects an io.ReadCloser; stdout already is one.
+	stream, format, err := wav.Decode(struct {
+		io.Reader
+		io.Closer
+	}{Reader: stdout, Closer: stdout})
+	if err != nil {
+		_ = cmd.Wait()
+		return nil, beep.Format{}, nil, fmt.Errorf("wav decode (via ffmpeg) failed: %v; ffmpeg: %s", err, stderr.String())
+	}
+
+	wait := func() error {
+		// Close streamer first, then wait for ffmpeg.
+		_ = stream.Close()
+		if err := cmd.Wait(); err != nil {
+			return fmt.Errorf("ffmpeg failed: %v; ffmpeg: %s", err, stderr.String())
+		}
+		return nil
+	}
+
+	return stream, format, wait, nil
 }
 
-func decodeFirst(path string) (*beep.Buffer, beep.Format, error) {
-	f, err := os.Open(path)
+func decodeToBufferFFmpeg(path string, want *beep.Format) (*beep.Buffer, beep.Format, error) {
+	stream, format, wait, err := ffmpegWavDecode(path)
 	if err != nil {
 		return nil, beep.Format{}, err
 	}
-	defer f.Close()
+	defer func() {
+		_ = wait()
+	}()
 
-	var (
-		stream beep.StreamSeekCloser
-		format beep.Format
-	)
-	ext := fileExtLower(path)
-
-	switch ext {
-	case ".wav":
-		stream, format, err = wav.Decode(f)
-	case ".mp3":
-		stream, format, err = mp3.Decode(f)
-	case ".flac":
-		stream, format, err = flac.Decode(f)
-	case ".ogg":
-		stream, format, err = vorbis.Decode(f)
-	default:
-		return nil, beep.Format{}, fmt.Errorf("unsupported extension %q (supported: .wav .mp3 .flac .ogg)", ext)
+	if want != nil {
+		if format.SampleRate != want.SampleRate || format.NumChannels != want.NumChannels {
+			return nil, beep.Format{}, fmt.Errorf(
+				"format mismatch for %s: got %d Hz, %d ch; want %d Hz, %d ch",
+				path, format.SampleRate, format.NumChannels, want.SampleRate, want.NumChannels,
+			)
+		}
 	}
-	if err != nil {
-		return nil, beep.Format{}, err
-	}
-	defer stream.Close()
 
 	buf := beep.NewBuffer(format)
-	buf.Append(stream)
+	buf.Append(stream) // decode whole file into memory
 	return buf, format, nil
-}
-
-func fileExtLower(path string) string {
-	// minimal dependency: find last dot
-	lastDot := -1
-	for i := len(path) - 1; i >= 0; i-- {
-		if path[i] == '.' {
-			lastDot = i
-			break
-		}
-		if path[i] == '/' || path[i] == '\\' {
-			break
-		}
-	}
-	if lastDot == -1 {
-		return ""
-	}
-	ext := path[lastDot:]
-	// ASCII lower
-	b := []byte(ext)
-	for i := range b {
-		if b[i] >= 'A' && b[i] <= 'Z' {
-			b[i] = b[i] - 'A' + 'a'
-		}
-	}
-	return string(b)
 }
 
 func main() {
 	var startIndex int
+	var showFilename bool
 	flag.IntVar(&startIndex, "i", 0, "start file index")
+	flag.BoolVar(&showFilename, "show-filename", false, "show filenames while switching (NOT blind)")
 	flag.Parse()
 	paths := flag.Args()
 
 	if len(paths) < 2 {
-		fmt.Fprintf(os.Stderr, "Usage: %s [-i startIndex] file1 file2 [file3...]\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Usage: %s [-i startIndex] [--show-filename] file1 file2 [file3...]\n", os.Args[0])
 		os.Exit(2)
 	}
 
-	// Load first file to establish format
-	firstBuf, format, err := decodeFirst(paths[0])
+	// First file establishes output format (decoded via ffmpeg->wav).
+	firstBuf, format, err := decodeToBufferFFmpeg(paths[0], nil)
 	if err != nil {
 		log.Fatalf("decode %s: %v", paths[0], err)
 	}
@@ -196,12 +155,11 @@ func main() {
 		buffers: []*beep.Buffer{firstBuf},
 		cur:     0,
 		pos:     0,
-		format:  format,
 	}
 
 	// Load remaining files
 	for _, p := range paths[1:] {
-		buf, err := decodeToBuffer(p, format)
+		buf, _, err := decodeToBufferFFmpeg(p, &format)
 		if err != nil {
 			log.Fatalf("decode %s: %v", p, err)
 		}
@@ -213,9 +171,11 @@ func main() {
 	}
 	switcher.cur = startIndex
 
-	fmt.Println("Controls: ←/→ switch file, q quit")
+	fmt.Println("Controls: ←/→ switch, q quit")
 	fmt.Printf("Loaded %d files. Format: %d Hz, %d ch\n", len(paths), format.SampleRate, format.NumChannels)
-	fmt.Printf("Start: [%d] %s\n", switcher.cur, paths[switcher.cur])
+	if showFilename {
+		fmt.Printf("Start: [%d] %s\n", switcher.cur, paths[switcher.cur])
+	}
 
 	// Start playback
 	speaker.Play(switcher)
@@ -227,7 +187,6 @@ func main() {
 	}
 	defer term.Restore(int(os.Stdin.Fd()), oldState)
 
-	// Read keypresses
 	buf := make([]byte, 16)
 	for {
 		n, err := os.Stdin.Read(buf)
@@ -244,7 +203,7 @@ func main() {
 			return
 		}
 
-		// Arrow keys are usually ESC [ D (left) and ESC [ C (right)
+		// Arrow keys: ESC [ D (left), ESC [ C (right)
 		if n >= 3 && buf[0] == 0x1b && buf[1] == '[' {
 			switch buf[2] {
 			case 'D': // left
@@ -252,13 +211,19 @@ func main() {
 				switcher.Add(-1)
 				cur := switcher.cur
 				speaker.Unlock()
-				fmt.Printf("\rNow: [%d] %s            ", cur, paths[cur])
+
+				if showFilename {
+					fmt.Printf("\rNow: [%d] %s            ", cur, paths[cur])
+				}
 			case 'C': // right
 				speaker.Lock()
 				switcher.Add(+1)
 				cur := switcher.cur
 				speaker.Unlock()
-				fmt.Printf("\rNow: [%d] %s            ", cur, paths[cur])
+
+				if showFilename {
+					fmt.Printf("\rNow: [%d] %s            ", cur, paths[cur])
+				}
 			}
 		}
 	}
