@@ -367,11 +367,12 @@ func defaultConfig() Config {
 	return Config{
 		SeekSeconds: 5,
 		Bindings: map[string][]string{
-			"next":          {"right"},
-			"prev":          {"left"},
-			"seek_forward":  {"up"},
-			"seek_backward": {"down"},
-			"quit":          {"q", "Q"},
+			"next":            {"right"},
+			"prev":            {"left"},
+			"seek_forward":    {"up"},
+			"seek_backward":   {"down"},
+			"toggle_filename": {"f"},
+			"quit":            {"q", "Q"},
 		},
 	}
 }
@@ -453,16 +454,6 @@ func parseKey(buf []byte, n int) string {
 	return ""
 }
 
-// func shuffleInUnison(paths []string, bufs []*beep.Buffer, r *rand.Rand) {
-// 	if len(paths) != len(bufs) {
-// 		return
-// 	}
-// 	r.Shuffle(len(paths), func(i, j int) {
-// 		paths[i], paths[j] = paths[j], paths[i]
-// 		bufs[i], bufs[j] = bufs[j], bufs[i]
-// 	})
-// }
-
 func main() {
 	var startIndex int
 	var showFilename bool
@@ -485,7 +476,7 @@ func main() {
 	seed := time.Now().UnixNano()
 	r := rand.New(rand.NewSource(seed))
 
-	// // Shuffle by default (unless --no-shuffle). Also randomize start track.
+	// Shuffle by default (unless --no-shuffle).
 	if !noShuffle {
 		r.Shuffle(len(paths), func(i, j int) { paths[i], paths[j] = paths[j], paths[i] })
 	}
@@ -508,6 +499,10 @@ func main() {
 	var jumpFramesAtomic int64 // frames to jump for seek
 	var seekSecondsAtomic uint64
 	atomic.StoreUint64(&seekSecondsAtomic, math.Float64bits(cfg.SeekSeconds))
+
+	// runtime filename visibility toggle (initialised from flag)
+	var showFilenameAtomic atomic.Bool
+	showFilenameAtomic.Store(showFilename)
 
 	// First decode establishes format (and starts speaker).
 	firstBuf, format, err := decodeToBufferFFmpegRawFloat32(paths[0], nil, verbose)
@@ -613,7 +608,7 @@ func main() {
 	} else {
 		fmt.Println("Order: as provided (--no-shuffle)")
 	}
-	if showFilename {
+	if showFilenameAtomic.Load() {
 		fmt.Printf("Start: [%d] %s\n", switcher.cur, paths[switcher.cur])
 	}
 
@@ -652,18 +647,22 @@ func main() {
 		switch action {
 		case "prev":
 			switcher.Add(-1)
-			if showFilename {
-				fmt.Printf("\rNow: [%d] %s            ", switcher.cur, paths[switcher.cur])
-			}
 		case "next":
 			switcher.Add(+1)
-			if showFilename {
-				fmt.Printf("\rNow: [%d] %s            ", switcher.cur, paths[switcher.cur])
-			}
 		case "seek_forward":
 			switcher.Seek(+jumpFrames)
 		case "seek_backward":
 			switcher.Seek(-jumpFrames)
+		case "toggle_filename":
+			showFilenameAtomic.Store(!showFilenameAtomic.Load())
+		}
+
+		// Refresh filename line if enabled
+		if showFilenameAtomic.Load() && (action == "prev" || action == "next" || action == "toggle_filename") {
+			fmt.Printf("\rNow: [%d] %s            ", switcher.cur, paths[switcher.cur])
+		}
+		if !showFilenameAtomic.Load() && action == "toggle_filename" {
+			fmt.Print("\r                              ")
 		}
 		speaker.Unlock()
 	}
