@@ -73,6 +73,19 @@ func (s *Switcher) Stream(samples [][2]float64) (n int, ok bool) {
 
 func (s *Switcher) Err() error { return nil }
 
+func (s *Switcher) Seek(deltaFrames int) {
+	s.mu.Lock()
+	s.pos += deltaFrames
+	if s.pos < 0 {
+		s.pos = 0
+	}
+	bufLen := s.buffers[s.cur].Len()
+	if s.pos > bufLen {
+		s.pos = bufLen
+	}
+	s.mu.Unlock()
+}
+
 type ffprobeOut struct {
 	Streams []struct {
 		SampleRate string `json:"sample_rate"`
@@ -297,6 +310,8 @@ func main() {
 		log.Fatalf("decode %s: %v", paths[0], err)
 	}
 
+	jumpFrames := int(format.SampleRate) * 5
+
 	bufferSize := format.SampleRate.N(50e6) // ~50ms
 	if bufferSize < 1024 {
 		bufferSize = 1024
@@ -369,6 +384,14 @@ func main() {
 				if showFilename {
 					fmt.Printf("\rNow: [%d] %s            ", cur, paths[cur])
 				}
+			case 'A': // up
+				speaker.Lock()
+				switcher.Seek(+jumpFrames)
+				speaker.Unlock()
+			case 'B': // down
+				speaker.Lock()
+				switcher.Seek(-jumpFrames)
+				speaker.Unlock()
 			}
 		}
 	}
