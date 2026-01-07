@@ -12,6 +12,8 @@ CLI A/B switcher for **blind, sample-synced audio comparisons**.
 - Play/pause support
 - Global A/B loop (kept across track switches)
 - Single-line status UI (index, state, loop, optional filename)
+- Mark tracks as **good** or **popped** (removed)
+- Résumé printed on exit (only if something was marked)
 
 ## Requirements
 
@@ -22,12 +24,12 @@ CLI A/B switcher for **blind, sample-synced audio comparisons**.
 
 ```sh
 go build
-````
+```
 
 ## Usage
 
 ```sh
-./ab_test [--config ab_test.json] [--no-shuffle] [--show-filename] [-info] [--verbose] [-i N] file1 file2 [file3...]
+./ab_test [--config ab_test.json] [--no-shuffle] [--show-filename] [--display-filename-on-change] [-info] [--verbose] [-i N] file1 file2 [file3...]
 ```
 
 By default, startup output is limited to:
@@ -62,6 +64,8 @@ Example:
     "toggle_filename": ["f"],
     "toggle_playback": [" "],
     "ab_loop": ["l"],
+    "mark_good": ["g"],
+    "pop": ["p"],
     "quit": ["q", "Q"]
   }
 }
@@ -80,4 +84,6 @@ Actions:
 * `toggle_filename`
 * `toggle_playback`
 * `ab_loop`
+* `mark_good`
+* `pop`
 * `quit`

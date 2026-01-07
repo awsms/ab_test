@@ -598,6 +598,8 @@ func defaultConfig() Config {
 			"toggle_filename": {"f"},
 			"toggle_playback": {" "},
 			"ab_loop":         {"l"},
+			"pop":             {"p"},
+			"mark_good":       {"g"},
 			"quit":            {"q", "Q"},
 		},
 	}
@@ -762,6 +764,26 @@ func renderLine(showFilename bool, paused bool, cur int, total int, path string,
 	fmt.Printf("\r%s", padOrTrim(left, w-1))
 }
 
+func clearStatusLine() {
+	w := termWidth()
+	fmt.Printf("\r%s\r", strings.Repeat(" ", w-1))
+}
+
+func removeAt[T any](s []T, i int) []T {
+	if i < 0 || i >= len(s) {
+		return s
+	}
+	copy(s[i:], s[i+1:])
+	return s[:len(s)-1]
+}
+
+func printList(title string, items []string) {
+	fmt.Printf("%s:\r\n", title)
+	for _, p := range items {
+		fmt.Printf("   - %s\r\n", p)
+	}
+}
+
 func main() {
 	var startIndex int
 	var showFilename bool
@@ -770,6 +792,7 @@ func main() {
 	var noShuffle bool
 	var targetSR string
 	var info bool
+	var displayFilenameOnChange bool
 	flag.BoolVar(&info, "info", false, "show startup info banner (controls/seek/resample/order/seed)")
 	flag.IntVar(&startIndex, "i", 0, "start file index")
 	flag.BoolVar(&showFilename, "show-filename", false, "show filenames while switching (NOT blind)")
@@ -777,6 +800,7 @@ func main() {
 	flag.StringVar(&configPath, "config", "", "path to config file (json). default: ./ab_test.json if present")
 	flag.BoolVar(&noShuffle, "no-shuffle", false, "do not randomize the file order (default: shuffle)")
 	flag.StringVar(&targetSR, "target-sr", "first", "output sample rate: first | highest | <number> (default: first)")
+	flag.BoolVar(&displayFilenameOnChange, "display-filename-on-change", false, "show filename when marking good / popping (default: false)")
 	flag.Parse()
 	paths := flag.Args()
 
@@ -801,7 +825,7 @@ func main() {
 	paths = filtered
 
 	if len(paths) < 2 {
-		fmt.Fprintf(os.Stderr, "Usage: %s [-i startIndex] [--show-filename] [--verbose] [--config path.json] [--no-shuffle] [--target-sr first|highest|N] file1 file2 [file3...]\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Usage: %s [-i startIndex] [--show-filename] [--verbose] [--config path.json] [--no-shuffle] [--target-sr first|highest|N] [--display-filename-on-change] file1 file2 [file3...]\n", os.Args[0])
 		os.Exit(2)
 	}
 
@@ -823,6 +847,12 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+
+	// Marking / popping state.
+	goodSet := make(map[string]bool)
+	poppedSet := make(map[string]bool)
+	goodList := make([]string, 0, 16)
+	poppedList := make([]string, 0, 16)
 
 	// Hot-reload state (atomics so the audio/input threads can read without locks).
 	var keymapAtomic atomic.Value // holds map[string]string
@@ -973,6 +1003,7 @@ func main() {
 	renderLine(showFilenameAtomic.Load(), ctrl.Paused, switcher.cur, len(paths), paths[switcher.cur], format.SampleRate, switcher.loopStage, switcher.loopA, switcher.loopB)
 
 	keybuf := make([]byte, 16)
+	quitNow := false
 	for {
 		n, _ := os.Stdin.Read(keybuf)
 		key := parseKey(keybuf, n)
@@ -992,7 +1023,8 @@ func main() {
 		}
 
 		if action == "quit" {
-			return
+			quitNow = true
+			break
 		}
 
 		jumpFrames := int(atomic.LoadInt64(&jumpFramesAtomic))
@@ -1035,9 +1067,94 @@ func main() {
 			if ev == "A" || ev == "B" || ev == "clear" {
 				// status is rendered below
 			}
+
+		case "mark_good":
+			curPath := paths[switcher.cur]
+			if !goodSet[curPath] {
+				goodSet[curPath] = true
+				goodList = append(goodList, curPath)
+
+				clearStatusLine()
+				if displayFilenameOnChange {
+					fmt.Printf("*good* %s\n", filepath.Base(curPath))
+				} else {
+					fmt.Printf("*good*\n")
+				}
+			}
+
+			// advance to next immediately
+			if ctrl.Paused {
+				switcher.AddInstant(+1)
+			} else {
+				switcher.Add(+1)
+			}
+
+		case "pop":
+			if len(paths) <= 1 {
+				clearStatusLine()
+				fmt.Printf("(can't pop last remaining track)\n")
+				break
+			}
+
+			idx := switcher.cur
+			curPath := paths[idx]
+
+			if !poppedSet[curPath] {
+				poppedSet[curPath] = true
+				poppedList = append(poppedList, curPath)
+			}
+
+			paths = removeAt(paths, idx)
+
+			switcher.mu.Lock()
+			switcher.buffers = removeAt(switcher.buffers, idx)
+
+			// Cancel any fade and keep playing from the next track (or wrap).
+			switcher.xfadeLeft = 0
+
+			if idx >= len(switcher.buffers) {
+				switcher.cur = 0
+			} else {
+				switcher.cur = idx
+			}
+
+			if len(switcher.buffers) > 0 {
+				bufLen := switcher.buffers[switcher.cur].Len()
+				if switcher.pos > bufLen {
+					switcher.pos = bufLen
+				}
+				switcher.clampLoopToCurrentLocked()
+			}
+			switcher.mu.Unlock()
+
+			clearStatusLine()
+			if displayFilenameOnChange {
+				fmt.Printf("*popped* %s\n", filepath.Base(curPath))
+			} else {
+				fmt.Printf("*popped*\n")
+			}
 		}
 
 		renderLine(showFilenameAtomic.Load(), ctrl.Paused, switcher.cur, len(paths), paths[switcher.cur], format.SampleRate, switcher.loopStage, switcher.loopA, switcher.loopB)
 		speaker.Unlock()
+	}
+
+	if quitNow {
+		if len(goodList) == 0 && len(poppedList) == 0 {
+			clearStatusLine()
+			fmt.Print("\r\n")
+			return
+		}
+
+		clearStatusLine()
+		fmt.Print("\r\n")
+
+		if len(goodList) > 0 {
+			printList("marked good", goodList)
+			fmt.Print("\r\n")
+		}
+		if len(poppedList) > 0 {
+			printList("popped", poppedList)
+		}
 	}
 }

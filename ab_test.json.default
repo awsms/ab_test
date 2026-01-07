@@ -8,6 +8,8 @@
     "toggle_filename": ["f"],
     "toggle_playback": [" "],
     "ab_loop": ["L"],
+    "mark_good": ["g"],
+    "pop": ["p"],
     "quit": ["q", "Q"]
   }
 }
