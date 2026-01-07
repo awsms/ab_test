@@ -502,6 +502,8 @@ func main() {
 	var configPath string
 	var noShuffle bool
 	var targetSR string
+	var info bool
+	flag.BoolVar(&info, "info", false, "show startup info banner (controls/seek/resample/order/seed)")
 	flag.IntVar(&startIndex, "i", 0, "start file index")
 	flag.BoolVar(&showFilename, "show-filename", false, "show filenames while switching (NOT blind)")
 	flag.BoolVar(&verbose, "verbose", false, "print ffprobe/ffmpeg diagnostics to stderr")
@@ -655,17 +657,22 @@ func main() {
 
 	// Print initial UI.
 	seekSeconds := math.Float64frombits(atomic.LoadUint64(&seekSecondsAtomic))
-	fmt.Println("Controls: (configurable) switch/seek/quit via config")
+
+	// Always show the essential line (default output).
 	fmt.Printf("Loaded %d files. Output: %d Hz, %d ch\n", len(paths), format.SampleRate, format.NumChannels)
-	fmt.Printf("Seek step: ±%.3g s\n", seekSeconds)
-	fmt.Printf("Resample: always (target-sr=%s)\n", targetSR)
-	if !noShuffle {
-		fmt.Printf("Order: shuffled (seed=%d)\n", seed)
-	} else {
-		fmt.Println("Order: as provided (--no-shuffle)")
-	}
-	if showFilenameAtomic.Load() {
-		fmt.Printf("Start: [%d] %s\n", switcher.cur, paths[switcher.cur])
+
+	if info {
+		fmt.Println("Controls: (configurable) switch/seek/quit via config")
+		fmt.Printf("Seek step: ±%.3g s\n", seekSeconds)
+		fmt.Printf("Resample: always (target-sr=%s)\n", targetSR)
+		if !noShuffle {
+			fmt.Printf("Order: shuffled (seed=%d)\n", seed)
+		} else {
+			fmt.Println("Order: as provided (--no-shuffle)")
+		}
+		if showFilenameAtomic.Load() {
+			fmt.Printf("Start: [%d] %s\n", switcher.cur, paths[switcher.cur])
+		}
 	}
 
 	speaker.Play(switcher)
