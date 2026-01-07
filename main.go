@@ -780,6 +780,26 @@ func main() {
 	flag.Parse()
 	paths := flag.Args()
 
+	// Filter out directories
+	filtered := make([]string, 0, len(paths))
+	for _, p := range paths {
+		st, err := os.Stat(p)
+		if err != nil {
+			if verbose {
+				fmt.Fprintf(os.Stderr, "skip %s: %v\n", p, err)
+			}
+			continue
+		}
+		if st.IsDir() {
+			if verbose {
+				fmt.Fprintf(os.Stderr, "skip dir: %s\n", p)
+			}
+			continue
+		}
+		filtered = append(filtered, p)
+	}
+	paths = filtered
+
 	if len(paths) < 2 {
 		fmt.Fprintf(os.Stderr, "Usage: %s [-i startIndex] [--show-filename] [--verbose] [--config path.json] [--no-shuffle] [--target-sr first|highest|N] file1 file2 [file3...]\n", os.Args[0])
 		os.Exit(2)
