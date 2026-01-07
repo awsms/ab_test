@@ -4,26 +4,29 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  build-and-release:
-    name: Build + Release
-    runs-on: ubuntu-latest
-
+  build:
+    name: Build (${{ matrix.goos }} ${{ matrix.goarch }})
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - goos: linux
+          - runner: ubuntu-latest
+            goos: linux
             goarch: amd64
             ext: ""
-          - goos: darwin
+          - runner: macos-latest
+            goos: darwin
             goarch: amd64
             ext: ""
-          - goos: windows
+          - runner: windows-latest
+            goos: windows
             goarch: amd64
             ext: ".exe"
 
@@ -37,16 +40,47 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      # Linux needs ALSA headers for oto/beep
+      - name: Install Linux audio deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev
+
       - name: Build
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
-          CGO_ENABLED: "0"
+          CGO_ENABLED: "1"
         run: |
           set -eux
           mkdir -p dist
           BIN="ab_test_${GOOS}_${GOARCH}${{ matrix.ext }}"
           go build -trimpath -ldflags "-s -w" -o "dist/${BIN}" .
+
+      - name: Upload artifact (job)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ab_test_${{ matrix.goos }}_${{ matrix.goarch }}
+          path: dist/*
+
+  release:
+    name: Publish Release Assets
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Flatten dist dir
+        run: |
+          set -eux
+          mkdir -p out
+          find dist -type f -maxdepth 2 -print -exec mv {} out/ \;
+          ls -la out
 
       - name: Create/Update GitHub Release + Upload Assets
         uses: softprops/action-gh-release@v2
@@ -57,4 +91,4 @@ jobs:
           prerelease: false
           generate_release_notes: true
           files: |
-            dist/*
+            out/*
