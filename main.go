@@ -262,17 +262,14 @@ func shellish(args []string) string {
 
 // decodeToBufferFFmpegRawFloat32 decodes any audio file using ffmpeg to raw f32le PCM.
 // IMPORTANT about "avoid resampling":
-//   - We DO NOT pass -ar (sample rate) or -ac (channels). So ffmpeg outputs the original
-//     stream's sample rate & channel count (no resample/downmix).
-//   - We query sr/ch via ffprobe so we can interpret the raw bytes correctly.
+//   - We DO pass -ar (sample rate) and -ac (channels) so every input is decoded to a shared output format.
+//   - We still query sr/ch via ffprobe for diagnostics, but we interpret the raw bytes using the output format.
 func decodeToBufferFFmpegRawFloat32(path string, want *beep.Format, verbose bool) (*beep.Buffer, beep.Format, error) {
+	// When want != nil, we will decode to want.SampleRate and want.NumChannels by passing -ar/-ac.
+	// When want == nil, we keep "avoid resampling" behavior (no -ar/-ac).
 	sr, ch, _, err := runFFprobe(path, verbose)
 	if err != nil {
 		return nil, beep.Format{}, err
-	}
-
-	if ch != 1 && ch != 2 {
-		return nil, beep.Format{}, fmt.Errorf("unsupported channel count %d for %s (only 1 or 2 supported)", ch, path)
 	}
 
 	args := []string{
@@ -281,11 +278,30 @@ func decodeToBufferFFmpegRawFloat32(path string, want *beep.Format, verbose bool
 		"-i", path,
 		"-vn",
 		"-map", "0:a:0",
-		// No -ar, no -ac => no resampling / no channel remix.
+	}
+
+	if want != nil {
+		// Allow comparing different source SR/ch by decoding everything to a shared output format.
+		args = append(args,
+			"-ar", fmt.Sprintf("%d", int(want.SampleRate)),
+			"-ac", fmt.Sprintf("%d", want.NumChannels),
+		)
+		// We'll interpret the raw bytes using the *output* format below.
+		sr = int(want.SampleRate)
+		ch = want.NumChannels
+	}
+
+	if ch != 1 && ch != 2 {
+		return nil, beep.Format{}, fmt.Errorf("unsupported channel count %d for %s (only 1 or 2 supported)", ch, path)
+	}
+
+	args = append(args,
+		// No -ar, no -ac => no resampling / no channel remix. (unless want != nil)
 		"-f", "f32le",
 		"-c:a", "pcm_f32le",
 		"pipe:1",
-	}
+	)
+
 	cmd := exec.Command("ffmpeg", args...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -314,12 +330,8 @@ func decodeToBufferFFmpegRawFloat32(path string, want *beep.Format, verbose bool
 		Precision:   2,
 	}
 
-	if want != nil {
-		if format.SampleRate != want.SampleRate || format.NumChannels != want.NumChannels {
-			return nil, beep.Format{}, fmt.Errorf("format mismatch for %s", path)
-		}
-	}
-
+	// If the decoded stream is mono, we duplicate to stereo.
+	// If it's stereo already, we map as-is.
 	var idx int
 	streamer := beep.StreamerFunc(func(out [][2]float64) (n int, ok bool) {
 		remaining := frames - (idx / ch)
@@ -454,22 +466,53 @@ func parseKey(buf []byte, n int) string {
 	return ""
 }
 
+func resolveTargetSampleRate(target string, paths []string, verbose bool) (int, error) {
+	if target == "" || target == "first" {
+		sr, _, _, err := runFFprobe(paths[0], verbose)
+		return sr, err
+	}
+	if target == "highest" {
+		maxSR := 0
+		for _, p := range paths {
+			sr, _, _, err := runFFprobe(p, verbose)
+			if err != nil {
+				return 0, err
+			}
+			if sr > maxSR {
+				maxSR = sr
+			}
+		}
+		if maxSR <= 0 {
+			return 0, fmt.Errorf("could not resolve highest sample rate")
+		}
+		return maxSR, nil
+	}
+	// numeric
+	n, err := strconv.Atoi(target)
+	if err != nil || n <= 0 {
+		return 0, fmt.Errorf("invalid --target-sr %q (use: first | highest | <number>)", target)
+	}
+	return n, nil
+}
+
 func main() {
 	var startIndex int
 	var showFilename bool
 	var verbose bool
 	var configPath string
 	var noShuffle bool
+	var targetSR string
 	flag.IntVar(&startIndex, "i", 0, "start file index")
 	flag.BoolVar(&showFilename, "show-filename", false, "show filenames while switching (NOT blind)")
 	flag.BoolVar(&verbose, "verbose", false, "print ffprobe/ffmpeg diagnostics to stderr")
 	flag.StringVar(&configPath, "config", "", "path to config file (json). default: ./ab_test.json if present")
 	flag.BoolVar(&noShuffle, "no-shuffle", false, "do not randomize the file order (default: shuffle)")
+	flag.StringVar(&targetSR, "target-sr", "first", "output sample rate: first | highest | <number> (default: first)")
 	flag.Parse()
 	paths := flag.Args()
 
 	if len(paths) < 2 {
-		fmt.Fprintf(os.Stderr, "Usage: %s [-i startIndex] [--show-filename] [--verbose] [--config path.json] [--no-shuffle] file1 file2 [file3...]\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Usage: %s [-i startIndex] [--show-filename] [--verbose] [--config path.json] [--no-shuffle] [--target-sr first|highest|N] file1 file2 [file3...]\n", os.Args[0])
 		os.Exit(2)
 	}
 
@@ -504,8 +547,20 @@ func main() {
 	var showFilenameAtomic atomic.Bool
 	showFilenameAtomic.Store(showFilename)
 
+	// Always resample: choose a shared output format.
+	outSR, err := resolveTargetSampleRate(targetSR, paths, verbose)
+	if err != nil {
+		log.Fatal(err)
+	}
+	// speaker/beep expects stereo frames [2]float64, so always decode to 2ch.
+	want := &beep.Format{
+		SampleRate:  beep.SampleRate(outSR),
+		NumChannels: 2,
+		Precision:   2,
+	}
+
 	// First decode establishes format (and starts speaker).
-	firstBuf, format, err := decodeToBufferFFmpegRawFloat32(paths[0], nil, verbose)
+	firstBuf, format, err := decodeToBufferFFmpegRawFloat32(paths[0], want, verbose)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -528,7 +583,7 @@ func main() {
 	buffers = append(buffers, firstBuf)
 
 	for _, p := range paths[1:] {
-		buf, _, err := decodeToBufferFFmpegRawFloat32(p, &format, verbose)
+		buf, _, err := decodeToBufferFFmpegRawFloat32(p, want, verbose)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -601,8 +656,9 @@ func main() {
 	// Print initial UI.
 	seekSeconds := math.Float64frombits(atomic.LoadUint64(&seekSecondsAtomic))
 	fmt.Println("Controls: (configurable) switch/seek/quit via config")
-	fmt.Printf("Loaded %d files. Format: %d Hz, %d ch\n", len(paths), format.SampleRate, format.NumChannels)
+	fmt.Printf("Loaded %d files. Output: %d Hz, %d ch\n", len(paths), format.SampleRate, format.NumChannels)
 	fmt.Printf("Seek step: ±%.3g s\n", seekSeconds)
+	fmt.Printf("Resample: always (target-sr=%s)\n", targetSR)
 	if !noShuffle {
 		fmt.Printf("Order: shuffled (seed=%d)\n", seed)
 	} else {
