@@ -9,6 +9,7 @@ CLI A/B switcher for **blind, sample-synced audio comparisons**.
 - Configurable keybinds + seek step (hot-reloaded)
 - Shuffles input order by default (use `--no-shuffle` to disable)
 - **Does NOT show filenames by default** (blind). Can be enabled/toggled.
+- Minimal startup output by default; use `-info` for full banner
 
 ## Requirements
 
@@ -24,8 +25,16 @@ go build
 ## Usage
 
 ```sh
-./ab_test [--config ab_test.json] [--no-shuffle] [--show-filename] [--verbose] [-i N] file1 file2 [file3...]
+./ab_test [--config ab_test.json] [--no-shuffle] [--show-filename] [-info] [--verbose] [-i N] file1 file2 [file3...]
 ```
+
+By default, startup output is limited to:
+
+```
+Loaded N files. Output: SR Hz, CH ch
+```
+
+Use `-info` to also show controls, seek step, resampling mode, and shuffle order.
 
 ## Config
 
