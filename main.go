@@ -25,74 +25,172 @@ type Switcher struct {
 	buffers []*beep.Buffer
 	cur     int // current buffer index
 	pos     int // current sample index (frames)
+
+	xfadeTotal int
+	xfadeLeft  int
+
+	fromCur int
+	toCur   int
+	fromPos int
+	toPos   int
+
+	tmpA [][2]float64
+	tmpB [][2]float64
+}
+
+func (s *Switcher) startTransition(toCur int, toPos int) {
+	// If we're already mid-fade, treat "current" as the fade target.
+	if s.xfadeLeft > 0 {
+		s.fromCur = s.toCur
+		s.fromPos = s.toPos
+	} else {
+		s.fromCur = s.cur
+		s.fromPos = s.pos
+	}
+
+	s.toCur = toCur
+	s.toPos = toPos
+
+	s.xfadeLeft = s.xfadeTotal
+
+	// Make the "active" selection be the target; Stream() will mix while fading.
+	s.cur = s.toCur
+	s.pos = s.toPos
 }
 
 func (s *Switcher) Add(delta int) {
 	s.mu.Lock()
 	n := len(s.buffers)
-	s.cur = (s.cur + delta) % n
-	if s.cur < 0 {
-		s.cur += n
+	next := (s.cur + delta) % n
+	if next < 0 {
+		next += n
 	}
+
+	// crossfade from current -> next at the same sample index (synced files)
+	s.startTransition(next, s.pos)
+
 	s.mu.Unlock()
 }
 
-func (s *Switcher) Stream(samples [][2]float64) (n int, ok bool) {
-	s.mu.RLock()
-	buf := s.buffers[s.cur]
-	pos := s.pos
-	s.mu.RUnlock()
+func (s *Switcher) Seek(deltaFrames int) {
+	s.mu.Lock()
 
+	target := s.pos + deltaFrames
+	if target < 0 {
+		target = 0
+	}
+	bufLen := s.buffers[s.cur].Len()
+	if target > bufLen {
+		target = bufLen
+	}
+
+	// crossfade within the same track: old position -> new position
+	s.startTransition(s.cur, target)
+
+	s.mu.Unlock()
+}
+
+func readFromBufferLoop(buf *beep.Buffer, pos *int, out [][2]float64) int {
+	if len(out) == 0 {
+		return 0
+	}
 	bufLen := buf.Len()
 	if bufLen <= 0 {
-		for i := range samples {
-			samples[i][0], samples[i][1] = 0, 0
+		for i := range out {
+			out[i][0], out[i][1] = 0, 0
 		}
+		return len(out)
+	}
+
+	written := 0
+	for written < len(out) {
+		if *pos >= bufLen {
+			*pos = 0
+		}
+		remain := len(out) - written
+		chunk := bufLen - *pos
+		if chunk > remain {
+			chunk = remain
+		}
+		st := buf.Streamer(*pos, *pos+chunk)
+		n, _ := st.Stream(out[written : written+chunk])
+		written += n
+		*pos += n
+		if n < chunk {
+			for i := written; i < len(out); i++ {
+				out[i][0], out[i][1] = 0, 0
+			}
+			return len(out)
+		}
+	}
+	return written
+}
+
+func (s *Switcher) Stream(samples [][2]float64) (n int, ok bool) {
+	s.mu.Lock()
+
+	// Crossfade path (used for both track switches and seeks).
+	if s.xfadeLeft > 0 && s.xfadeTotal > 0 {
+		k := len(samples)
+		if s.xfadeLeft < k {
+			k = s.xfadeLeft
+		}
+
+		if cap(s.tmpA) < k {
+			s.tmpA = make([][2]float64, k)
+			s.tmpB = make([][2]float64, k)
+		}
+		a := s.tmpA[:k]
+		b := s.tmpB[:k]
+
+		fromBuf := s.buffers[s.fromCur]
+		toBuf := s.buffers[s.toCur]
+
+		fp := s.fromPos
+		tp := s.toPos
+
+		readFromBufferLoop(fromBuf, &fp, a)
+		readFromBufferLoop(toBuf, &tp, b)
+
+		start := s.xfadeTotal - s.xfadeLeft // frames already faded
+		for i := 0; i < k; i++ {
+			t := float64(start+i) / float64(s.xfadeTotal) // 0..1
+			ga := math.Cos(t * math.Pi * 0.5)
+			gb := math.Sin(t * math.Pi * 0.5)
+			samples[i][0] = ga*a[i][0] + gb*b[i][0]
+			samples[i][1] = ga*a[i][1] + gb*b[i][1]
+		}
+
+		s.fromPos = fp
+		s.toPos = tp
+		s.pos = tp
+		s.cur = s.toCur
+
+		s.xfadeLeft -= k
+
+		// Fill the rest (if any) from the target stream (looping).
+		if k < len(samples) {
+			buf := s.buffers[s.cur]
+			p := s.pos
+			readFromBufferLoop(buf, &p, samples[k:])
+			s.pos = p
+		}
+
+		s.mu.Unlock()
 		return len(samples), true
 	}
 
-	// loop instead of stopping
-	if pos >= bufLen {
-		s.mu.Lock()
-		s.pos = 0
-		pos = 0
-		s.mu.Unlock()
-	}
+	// Normal path: loop forever.
+	buf := s.buffers[s.cur]
+	p := s.pos
+	readFromBufferLoop(buf, &p, samples)
+	s.pos = p
 
-	end := pos + len(samples)
-	if end > bufLen {
-		end = bufLen
-	}
-
-	streamer := buf.Streamer(pos, end)
-	n, _ = streamer.Stream(samples[:end-pos])
-
-	// pad remainder if we wrapped
-	for i := n; i < len(samples); i++ {
-		samples[i][0], samples[i][1] = 0, 0
-	}
-
-	s.mu.Lock()
-	s.pos += n
 	s.mu.Unlock()
-
 	return len(samples), true
 }
 
 func (s *Switcher) Err() error { return nil }
-
-func (s *Switcher) Seek(deltaFrames int) {
-	s.mu.Lock()
-	s.pos += deltaFrames
-	if s.pos < 0 {
-		s.pos = 0
-	}
-	bufLen := s.buffers[s.cur].Len()
-	if s.pos > bufLen {
-		s.pos = bufLen
-	}
-	s.mu.Unlock()
-}
 
 type ffprobeOut struct {
 	Streams []struct {
@@ -180,6 +278,7 @@ func decodeToBufferFFmpegRawFloat32(path string, want *beep.Format, verbose bool
 		"-i", path,
 		"-vn",
 		"-map", "0:a:0",
+		// No -ar, no -ac => no resampling / no channel remix.
 		"-f", "f32le",
 		"-c:a", "pcm_f32le",
 		"pipe:1",
@@ -202,6 +301,9 @@ func decodeToBufferFFmpegRawFloat32(path string, want *beep.Format, verbose bool
 
 	totalF32 := len(raw) / 4
 	frames := totalF32 / ch
+	if frames <= 0 {
+		return nil, beep.Format{}, fmt.Errorf("decoded 0 frames from %s", path)
+	}
 
 	format := beep.Format{
 		SampleRate:  beep.SampleRate(sr),
@@ -242,6 +344,9 @@ func decodeToBufferFFmpegRawFloat32(path string, want *beep.Format, verbose bool
 
 	buf := beep.NewBuffer(format)
 	buf.Append(streamer)
+	if buf.Len() == 0 {
+		return nil, beep.Format{}, fmt.Errorf("decoded 0 frames from %s", path)
+	}
 	return buf, format, nil
 }
 
@@ -282,7 +387,13 @@ func main() {
 		buffers: []*beep.Buffer{firstBuf},
 		cur:     0,
 		pos:     0,
+		// short equal-power crossfade to avoid clicks on switches/seeks
+		xfadeTotal: int(format.SampleRate) * 5 / 1000, // 5ms
 	}
+	if switcher.xfadeTotal < 1 {
+		switcher.xfadeTotal = 1
+	}
+
 	for _, p := range paths[1:] {
 		buf, _, err := decodeToBufferFFmpegRawFloat32(p, &format, verbose)
 		if err != nil {
