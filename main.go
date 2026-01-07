@@ -8,11 +8,14 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"math/rand"
 	"os"
 	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"golang.org/x/term"
 
@@ -450,38 +453,74 @@ func parseKey(buf []byte, n int) string {
 	return ""
 }
 
+// func shuffleInUnison(paths []string, bufs []*beep.Buffer, r *rand.Rand) {
+// 	if len(paths) != len(bufs) {
+// 		return
+// 	}
+// 	r.Shuffle(len(paths), func(i, j int) {
+// 		paths[i], paths[j] = paths[j], paths[i]
+// 		bufs[i], bufs[j] = bufs[j], bufs[i]
+// 	})
+// }
+
 func main() {
 	var startIndex int
 	var showFilename bool
 	var verbose bool
 	var configPath string
+	var noShuffle bool
 	flag.IntVar(&startIndex, "i", 0, "start file index")
 	flag.BoolVar(&showFilename, "show-filename", false, "show filenames while switching (NOT blind)")
 	flag.BoolVar(&verbose, "verbose", false, "print ffprobe/ffmpeg diagnostics to stderr")
 	flag.StringVar(&configPath, "config", "", "path to config file (json). default: ./ab_test.json if present")
+	flag.BoolVar(&noShuffle, "no-shuffle", false, "do not randomize the file order (default: shuffle)")
 	flag.Parse()
 	paths := flag.Args()
 
 	if len(paths) < 2 {
-		fmt.Fprintf(os.Stderr, "Usage: %s [-i startIndex] [--show-filename] [--verbose] [--config path.json] file1 file2 [file3...]\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Usage: %s [-i startIndex] [--show-filename] [--verbose] [--config path.json] [--no-shuffle] file1 file2 [file3...]\n", os.Args[0])
 		os.Exit(2)
 	}
 
-	cfg, err := loadConfig(configPath)
+	seed := time.Now().UnixNano()
+	r := rand.New(rand.NewSource(seed))
+
+	// // Shuffle by default (unless --no-shuffle). Also randomize start track.
+	if !noShuffle {
+		r.Shuffle(len(paths), func(i, j int) { paths[i], paths[j] = paths[j], paths[i] })
+	}
+
+	// Resolve the effective config path we will monitor.
+	effectiveConfigPath := configPath
+	if effectiveConfigPath == "" {
+		effectiveConfigPath = "ab_test.json"
+	}
+
+	cfg, err := loadConfig(effectiveConfigPath)
 	if err != nil {
 		log.Fatal(err)
 	}
-	keymap := buildKeymap(cfg)
 
+	// Hot-reload state (atomics so the audio/input threads can read without locks).
+	var keymapAtomic atomic.Value // holds map[string]string
+	keymapAtomic.Store(buildKeymap(cfg))
+
+	var jumpFramesAtomic int64 // frames to jump for seek
+	var seekSecondsAtomic uint64
+	atomic.StoreUint64(&seekSecondsAtomic, math.Float64bits(cfg.SeekSeconds))
+
+	// First decode establishes format (and starts speaker).
 	firstBuf, format, err := decodeToBufferFFmpegRawFloat32(paths[0], nil, verbose)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	jumpFrames := int(float64(format.SampleRate) * cfg.SeekSeconds)
-	if jumpFrames < 1 {
-		jumpFrames = 1
+	// Compute jump frames from seek seconds.
+	jf := int64(float64(format.SampleRate) * cfg.SeekSeconds)
+	if jf < 1 {
+		jf = 1
 	}
+	atomic.StoreInt64(&jumpFramesAtomic, jf)
 
 	bufferSize := format.SampleRate.N(50e6)
 	if bufferSize < 1024 {
@@ -489,8 +528,20 @@ func main() {
 	}
 	speaker.Init(format.SampleRate, bufferSize)
 
+	// Load remaining files.
+	buffers := make([]*beep.Buffer, 0, len(paths))
+	buffers = append(buffers, firstBuf)
+
+	for _, p := range paths[1:] {
+		buf, _, err := decodeToBufferFFmpegRawFloat32(p, &format, verbose)
+		if err != nil {
+			log.Fatal(err)
+		}
+		buffers = append(buffers, buf)
+	}
+
 	switcher := &Switcher{
-		buffers: []*beep.Buffer{firstBuf},
+		buffers: buffers,
 		cur:     0,
 		pos:     0,
 		// short equal-power crossfade to avoid clicks on switches/seeks
@@ -500,20 +551,68 @@ func main() {
 		switcher.xfadeTotal = 1
 	}
 
-	for _, p := range paths[1:] {
-		buf, _, err := decodeToBufferFFmpegRawFloat32(p, &format, verbose)
-		if err != nil {
-			log.Fatal(err)
-		}
-		switcher.buffers = append(switcher.buffers, buf)
-	}
-
 	if startIndex >= 0 && startIndex < len(switcher.buffers) {
 		switcher.cur = startIndex
 	}
 
-	fmt.Println("Controls: ←/→ switch, ↑/↓ ±5s, q quit")
+	// Hot-reload goroutine: watch mtime and apply new bindings/seek_seconds.
+	// (No extra deps like fsnotify; simple polling is reliable across platforms.)
+	go func() {
+		t := time.NewTicker(400 * time.Millisecond)
+		defer t.Stop()
+
+		var lastMod time.Time
+		for range t.C {
+			st, err := os.Stat(effectiveConfigPath)
+			if err != nil {
+				// If it doesn't exist, keep waiting (user may create it later).
+				if os.IsNotExist(err) {
+					lastMod = time.Time{}
+					continue
+				}
+				continue
+			}
+
+			mod := st.ModTime()
+			if !mod.After(lastMod) {
+				continue
+			}
+
+			newCfg, err := loadConfig(effectiveConfigPath)
+			if err != nil {
+				if verbose {
+					fmt.Fprintf(os.Stderr, "config reload failed: %v\n", err)
+				}
+				continue
+			}
+
+			keymapAtomic.Store(buildKeymap(newCfg))
+			atomic.StoreUint64(&seekSecondsAtomic, math.Float64bits(newCfg.SeekSeconds))
+
+			newJf := int64(float64(format.SampleRate) * newCfg.SeekSeconds)
+			if newJf < 1 {
+				newJf = 1
+			}
+			atomic.StoreInt64(&jumpFramesAtomic, newJf)
+
+			lastMod = mod
+
+			if verbose {
+				fmt.Fprintf(os.Stderr, "reloaded config from %s (seek_seconds=%.3g)\n", effectiveConfigPath, newCfg.SeekSeconds)
+			}
+		}
+	}()
+
+	// Print initial UI.
+	seekSeconds := math.Float64frombits(atomic.LoadUint64(&seekSecondsAtomic))
+	fmt.Println("Controls: (configurable) switch/seek/quit via config")
 	fmt.Printf("Loaded %d files. Format: %d Hz, %d ch\n", len(paths), format.SampleRate, format.NumChannels)
+	fmt.Printf("Seek step: ±%.3g s\n", seekSeconds)
+	if !noShuffle {
+		fmt.Printf("Order: shuffled (seed=%d)\n", seed)
+	} else {
+		fmt.Println("Order: as provided (--no-shuffle)")
+	}
 	if showFilename {
 		fmt.Printf("Start: [%d] %s\n", switcher.cur, paths[switcher.cur])
 	}
@@ -531,6 +630,12 @@ func main() {
 			continue
 		}
 
+		kmAny := keymapAtomic.Load()
+		if kmAny == nil {
+			continue
+		}
+		keymap := kmAny.(map[string]string)
+
 		action := keymap[key]
 		if action == "" {
 			continue
@@ -540,6 +645,8 @@ func main() {
 			fmt.Println("\nBye.")
 			return
 		}
+
+		jumpFrames := int(atomic.LoadInt64(&jumpFramesAtomic))
 
 		speaker.Lock()
 		switch action {
