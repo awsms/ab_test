@@ -429,8 +429,14 @@ func main() {
 			switch keybuf[2] {
 			case 'D':
 				switcher.Add(-1)
+				if showFilename {
+					fmt.Printf("\rNow: [%d] %s            ", switcher.cur, paths[switcher.cur])
+				}
 			case 'C':
 				switcher.Add(+1)
+				if showFilename {
+					fmt.Printf("\rNow: [%d] %s            ", switcher.cur, paths[switcher.cur])
+				}
 			case 'A':
 				switcher.Seek(+jumpFrames)
 			case 'B':
