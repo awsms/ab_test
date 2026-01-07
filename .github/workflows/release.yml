@@ -48,6 +48,7 @@ jobs:
           sudo apt-get install -y libasound2-dev
 
       - name: Build
+        shell: bash
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
@@ -57,6 +58,7 @@ jobs:
           mkdir -p dist
           BIN="ab_test_${GOOS}_${GOARCH}${{ matrix.ext }}"
           go build -trimpath -ldflags "-s -w" -o "dist/${BIN}" .
+
 
       - name: Upload artifact (job)
         uses: actions/upload-artifact@v4
