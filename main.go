@@ -355,27 +355,133 @@ func f32From(b []byte, i int) float32 {
 	return math.Float32frombits(binary.LittleEndian.Uint32(b[off:]))
 }
 
+type Config struct {
+	SeekSeconds float64             `json:"seek_seconds"`
+	Bindings    map[string][]string `json:"bindings"`
+}
+
+func defaultConfig() Config {
+	return Config{
+		SeekSeconds: 5,
+		Bindings: map[string][]string{
+			"next":          {"right"},
+			"prev":          {"left"},
+			"seek_forward":  {"up"},
+			"seek_backward": {"down"},
+			"quit":          {"q", "Q"},
+		},
+	}
+}
+
+// loads config if path exists; otherwise returns defaults.
+// if path is empty, tries ./ab_test.json (optional).
+func loadConfig(path string) (Config, error) {
+	cfg := defaultConfig()
+
+	// Optional auto-default: if no --config provided, try ./ab_test.json
+	if path == "" {
+		path = "ab_test.json"
+	}
+
+	b, err := os.ReadFile(path)
+	if err != nil {
+		// if file doesn't exist, just use defaults
+		if os.IsNotExist(err) {
+			return cfg, nil
+		}
+		return cfg, err
+	}
+
+	var userCfg Config
+	if err := json.Unmarshal(b, &userCfg); err != nil {
+		return cfg, fmt.Errorf("parse %s: %w", path, err)
+	}
+
+	// merge
+	if userCfg.SeekSeconds > 0 {
+		cfg.SeekSeconds = userCfg.SeekSeconds
+	}
+	if userCfg.Bindings != nil {
+		for action, keys := range userCfg.Bindings {
+			if len(keys) > 0 {
+				cfg.Bindings[action] = keys
+			}
+		}
+	}
+
+	return cfg, nil
+}
+
+func buildKeymap(cfg Config) map[string]string {
+	// key -> action
+	m := make(map[string]string)
+	for action, keys := range cfg.Bindings {
+		for _, k := range keys {
+			if k == "" {
+				continue
+			}
+			m[k] = action
+		}
+	}
+	return m
+}
+
+func parseKey(buf []byte, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	// Arrow keys: ESC [ A/B/C/D
+	if n >= 3 && buf[0] == 0x1b && buf[1] == '[' {
+		switch buf[2] {
+		case 'A':
+			return "up"
+		case 'B':
+			return "down"
+		case 'C':
+			return "right"
+		case 'D':
+			return "left"
+		}
+	}
+	// Single-byte keys
+	if n == 1 {
+		return string(buf[0])
+	}
+	return ""
+}
+
 func main() {
 	var startIndex int
 	var showFilename bool
 	var verbose bool
+	var configPath string
 	flag.IntVar(&startIndex, "i", 0, "start file index")
 	flag.BoolVar(&showFilename, "show-filename", false, "show filenames while switching (NOT blind)")
 	flag.BoolVar(&verbose, "verbose", false, "print ffprobe/ffmpeg diagnostics to stderr")
+	flag.StringVar(&configPath, "config", "", "path to config file (json). default: ./ab_test.json if present")
 	flag.Parse()
 	paths := flag.Args()
 
 	if len(paths) < 2 {
-		fmt.Fprintf(os.Stderr, "Usage: %s [-i startIndex] [--show-filename] [--verbose] file1 file2 [file3...]\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Usage: %s [-i startIndex] [--show-filename] [--verbose] [--config path.json] file1 file2 [file3...]\n", os.Args[0])
 		os.Exit(2)
 	}
+
+	cfg, err := loadConfig(configPath)
+	if err != nil {
+		log.Fatal(err)
+	}
+	keymap := buildKeymap(cfg)
 
 	firstBuf, format, err := decodeToBufferFFmpegRawFloat32(paths[0], nil, verbose)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	jumpFrames := int(format.SampleRate) * 5
+	jumpFrames := int(float64(format.SampleRate) * cfg.SeekSeconds)
+	if jumpFrames < 1 {
+		jumpFrames = 1
+	}
 
 	bufferSize := format.SampleRate.N(50e6)
 	if bufferSize < 1024 {
@@ -420,29 +526,38 @@ func main() {
 	keybuf := make([]byte, 16)
 	for {
 		n, _ := os.Stdin.Read(keybuf)
-		if n == 1 && (keybuf[0] == 'q' || keybuf[0] == 'Q') {
+		key := parseKey(keybuf, n)
+		if key == "" {
+			continue
+		}
+
+		action := keymap[key]
+		if action == "" {
+			continue
+		}
+
+		if action == "quit" {
 			fmt.Println("\nBye.")
 			return
 		}
-		if n >= 3 && keybuf[0] == 0x1b && keybuf[1] == '[' {
-			speaker.Lock()
-			switch keybuf[2] {
-			case 'D':
-				switcher.Add(-1)
-				if showFilename {
-					fmt.Printf("\rNow: [%d] %s            ", switcher.cur, paths[switcher.cur])
-				}
-			case 'C':
-				switcher.Add(+1)
-				if showFilename {
-					fmt.Printf("\rNow: [%d] %s            ", switcher.cur, paths[switcher.cur])
-				}
-			case 'A':
-				switcher.Seek(+jumpFrames)
-			case 'B':
-				switcher.Seek(-jumpFrames)
+
+		speaker.Lock()
+		switch action {
+		case "prev":
+			switcher.Add(-1)
+			if showFilename {
+				fmt.Printf("\rNow: [%d] %s            ", switcher.cur, paths[switcher.cur])
 			}
-			speaker.Unlock()
+		case "next":
+			switcher.Add(+1)
+			if showFilename {
+				fmt.Printf("\rNow: [%d] %s            ", switcher.cur, paths[switcher.cur])
+			}
+		case "seek_forward":
+			switcher.Seek(+jumpFrames)
+		case "seek_backward":
+			switcher.Seek(-jumpFrames)
 		}
+		speaker.Unlock()
 	}
 }

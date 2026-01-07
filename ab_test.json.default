@@ -1,0 +1,10 @@
+{
+  "seek_seconds": 5,
+  "bindings": {
+    "next": ["right", "l"],
+    "prev": ["left", "h"],
+    "seek_forward": ["up", "k"],
+    "seek_backward": ["down", "j"],
+    "quit": ["q", "Q"]
+  }
+}
