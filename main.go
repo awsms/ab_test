@@ -335,6 +335,31 @@ func readFromBufferLoopRegion(buf *beep.Buffer, pos *int, out [][2]float64, loop
 	return written
 }
 
+func reShuffle(r *rand.Rand, paths []string, bufs []*beep.Buffer, cur int) (newCur int) {
+	n := len(paths)
+	if n == 0 || cur < 0 || cur >= n {
+		return cur
+	}
+
+	// Identify the currently playing track by its unique path.
+	curPath := paths[cur]
+
+	// Shuffle paths and buffers together.
+	r.Shuffle(n, func(i, j int) {
+		paths[i], paths[j] = paths[j], paths[i]
+		bufs[i], bufs[j] = bufs[j], bufs[i]
+	})
+
+	// Find where the currently playing track ended up.
+	for i := 0; i < n; i++ {
+		if paths[i] == curPath {
+			return i
+		}
+	}
+	// Should never happen unless there are duplicate paths or external mutation.
+	return cur
+}
+
 func (s *Switcher) Stream(samples [][2]float64) (n int, ok bool) {
 	s.mu.Lock()
 
@@ -631,6 +656,7 @@ func defaultConfig() Config {
 			"ab_loop":         {"l"},
 			"pop":             {"p"},
 			"mark_good":       {"g"},
+			"shuffle":         {"s"},
 			"quit":            {"q", "Q"},
 		},
 	}
@@ -1184,6 +1210,34 @@ func main() {
 			} else {
 				fmt.Printf("*popped*\n")
 			}
+
+		case "shuffle":
+			// Cancel any fade first so indices don't suddenly point at different buffers.
+			switcher.mu.Lock()
+			switcher.xfadeLeft = 0
+			switcher.fromCur = switcher.cur
+			switcher.toCur = switcher.cur
+			switcher.fromPos = switcher.pos
+			switcher.toPos = switcher.pos
+
+			// Shuffle the entire playlist, but keep playing the same track by updating cur.
+			newCur := reShuffle(r, paths, switcher.buffers, switcher.cur)
+			switcher.cur = newCur
+
+			// Loop bounds are "global", but clamp position to current buffer length just in case.
+			if len(switcher.buffers) > 0 {
+				bufLen := switcher.buffers[switcher.cur].Len()
+				if switcher.pos > bufLen {
+					switcher.pos = bufLen
+				}
+				switcher.clampLoopToCurrentLocked()
+			}
+
+			switcher.mu.Unlock()
+
+			clearStatusLine()
+			fmt.Printf("*shuffled*\n")
+
 		}
 
 		renderLine(showFilenameAtomic.Load(), ctrl.Paused, switcher.cur, len(paths), paths[switcher.cur], format.SampleRate, switcher.loopStage, switcher.loopA, switcher.loopB)
